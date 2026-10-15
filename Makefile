@@ -19,13 +19,15 @@ ifeq ($(UNAME_S),Darwin)
     RUSTFLAGS_EXTRA := -C target-feature=+avx2,+fma
     TARGET := x86_64-apple-darwin
   endif
-  PICKBRAIN_FEATURES := $(CLI_FEATURES),embed-assets
 else ifeq ($(UNAME_S),Linux)
   CLI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,progress
   NAPI_FEATURES := t5-quantized,fbgemm,napi
   RUSTFLAGS_EXTRA :=
   TARGET :=
 endif
+
+PICKBRAIN_FEATURES := $(CLI_FEATURES),embed-assets
+CARGO := $(shell command -v cargo 2> /dev/null || echo $(HOME)/.cargo/bin/cargo)
 
 # Binary path
 ifdef TARGET
@@ -74,11 +76,12 @@ pickbrain: download
 	cargo build --release $(BUILD_TARGET) --features $(PICKBRAIN_FEATURES) --example pickbrain
 	ln -sf target/$(TARGET)/release/examples/pickbrain ./pickbrain
 
-pickbrain-install: pickbrain
-	mkdir -p ~/bin ~/.claude/skills/pickbrain ~/.codex/skills/pickbrain
-	ln -sf $(realpath pickbrain) ~/bin/pickbrain
+pickbrain-install:
+	$(CARGO) install --path . --features $(PICKBRAIN_FEATURES) --bin pickbrain
+	mkdir -p ~/.claude/skills/pickbrain ~/.codex/skills/pickbrain ~/.gemini/antigravity/skills/pickbrain
 	cp skills/pickbrain/SKILL.md ~/.claude/skills/pickbrain/SKILL.md
 	cp skills/pickbrain-codex/SKILL.md ~/.codex/skills/pickbrain/SKILL.md
+	cp skills/pickbrain/GEMINI_SKILL.md ~/.gemini/antigravity/skills/pickbrain/SKILL.md
 
 macintel:
 	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features t5-quantized,fbgemm,hybrid-dequant,progress

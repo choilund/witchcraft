@@ -318,7 +318,7 @@ pub fn ingest_codex(db: &mut DB) -> Result<usize> {
             continue;
         }
         let mtime_ms = file_mtime_ms(&jsonl_path).unwrap_or(0);
-        println!("{}", jsonl_path.display());
+        eprintln!("{}", jsonl_path.display());
         match ingest_session(db, &jsonl_path, mtime_ms) {
             Ok(n) => session_count += n,
             Err(e) => {

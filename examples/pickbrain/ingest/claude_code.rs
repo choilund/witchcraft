@@ -64,6 +64,7 @@ struct Chunk {
     ts_ms: i64,
     byte_offset: u64,
     byte_len: u64,
+    tools: Vec<String>,
 }
 
 fn codepoint_len(s: &str) -> usize {
@@ -232,8 +233,15 @@ fn parse_session_file(path: &Path) -> Vec<Chunk> {
             .map(|dt| dt.timestamp_millis())
             .unwrap_or(0);
 
-        if ts_ms <= 0 {
-            continue;
+        let mut tools = Vec::new();
+        if let Content::Blocks(blocks) = content {
+            for block in blocks {
+                if block.block_type == "tool_use" {
+                    if let Some(ref name) = block.name {
+                        tools.push(name.clone());
+                    }
+                }
+            }
         }
 
         chunks.push(Chunk {
@@ -243,6 +251,7 @@ fn parse_session_file(path: &Path) -> Vec<Chunk> {
             ts_ms,
             byte_offset: line_offset,
             byte_len: line.len() as u64,
+            tools,
         });
     }
 
@@ -288,6 +297,7 @@ fn ingest_session(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -
         let mut all_parts = vec![header];
         let mut turns_meta: Vec<serde_json::Value> = Vec::new();
 
+        let mut interaction_tools = Vec::new();
         for chunk in *interaction {
             let label = if chunk.role == "user" {
                 "[User]"
@@ -301,7 +311,10 @@ fn ingest_session(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -
                 "off": chunk.byte_offset,
                 "len": chunk.byte_len,
             }));
+            interaction_tools.extend(chunk.tools.clone());
         }
+        interaction_tools.sort();
+        interaction_tools.dedup();
 
         let lengths: Vec<usize> = all_parts.iter().map(|p| p.chars().count()).collect();
         let body = all_parts.join("");
@@ -322,6 +335,8 @@ fn ingest_session(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -
             "path": path.to_string_lossy(),
             "mtime_ms": mtime_ms,
             "turns": turns_meta,
+            "tools": interaction_tools,
+            "source": "claude",
         })
         .to_string();
 
@@ -487,7 +502,7 @@ pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize, usize)> {
     let projects_dir = PathBuf::from(&home).join(".claude/projects");
 
     if !projects_dir.is_dir() {
-        println!("no Claude Code projects found at {}", projects_dir.display());
+        eprintln!("no Claude Code projects found at {}", projects_dir.display());
         return Ok((0, 0, 0));
     }
 
@@ -527,7 +542,7 @@ pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize, usize)> {
                 continue;
             }
             let mtime_ms = file_mtime_ms(jsonl_path).unwrap_or(0);
-            println!("{}", jsonl_path.display());
+            eprintln!("{}", jsonl_path.display());
             for p in extract_written_paths(jsonl_path) {
                 if p.extension().is_some_and(|ext| ext == "md") && p.is_file() {
                     authored_paths.insert(p);
@@ -556,7 +571,7 @@ pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize, usize)> {
                 if !watermark::file_newer_than(md_path, wm_ts) {
                     continue;
                 }
-                println!("{}", md_path.display());
+                eprintln!("{}", md_path.display());
                 let mtime_ms = file_mtime_ms(md_path).unwrap_or(0);
                 match ingest_memory_file(db, md_path, &project_name, mtime_ms) {
                     Ok(true) => memory_count += 1,
@@ -576,7 +591,7 @@ pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize, usize)> {
                 continue;
             }
             let mtime_ms = file_mtime_ms(md_path).unwrap_or(0);
-            println!("{}", md_path.display());
+            eprintln!("{}", md_path.display());
             match ingest_authored_file(db, md_path, &project_name, mtime_ms) {
                 Ok(true) => authored_count += 1,
                 Ok(false) => {}

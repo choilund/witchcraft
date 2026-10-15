@@ -7,9 +7,13 @@ license = "Apache-2.0"
 [workspace]                     # !Dash
 members = ["tools/quantize-tool", "tools/t5-bench", "tools/ov-stress", "tools/compare-backends"] # !Dash
 
-[[bin]]                         # !Dash
-name = "warp-cli"               # !Dash
-path = "src/main.rs"            # !Dash
+[[bin]]
+name = "warp-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "pickbrain"
+path = "examples/pickbrain/main.rs"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -50,12 +54,13 @@ lz4_flex = "0.11.5"
 strsim = "0.11.1"
 rayon = { version = "1", optional = true }
 fbgemm-rs = { path = "fbgemm-rs", optional = true, features = ["rayon"] }
-
-[dev-dependencies]
-test-log = { version = "0.2.16", features = ["trace", "color"] }
+notify = "8.2.0"
 ratatui = "0.29"
 crossterm = "0.28"
 libc = "0.2"
+
+[dev-dependencies]
+test-log = { version = "0.2.16", features = ["trace", "color"] }
 
 # Apple Silicon (ARM) - enable Metal support
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]

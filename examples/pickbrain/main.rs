@@ -4,8 +4,9 @@ use std::env;
 use std::io::Write;
 use std::path::PathBuf;
 
-mod claude_code;
-mod codex;
+mod ingest;
+mod mcp;
+pub mod watcher;
 mod watermark;
 
 use witchcraft::{DB, Embedder};
@@ -28,30 +29,58 @@ impl log::Log for SimpleLogger {
 static LOGGER: SimpleLogger = SimpleLogger;
 
 fn db_path() -> PathBuf {
+    if let Ok(db_env) = env::var("PICKBRAIN_DB") {
+        let path = PathBuf::from(db_env);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        return path;
+    }
+
     let home = env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".claude/pickbrain.db")
+    let dir = PathBuf::from(&home).join(".pickbrain");
+    let old_db = PathBuf::from(&home).join(".claude/pickbrain.db");
+    
+    // Auto-migration from legacy .claude path
+    if !dir.exists() && old_db.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+        let new_db = dir.join("pickbrain.db");
+        if std::fs::copy(&old_db, &new_db).is_ok() {
+            eprintln!("Migrated Pickbrain database from ~/.claude to ~/.pickbrain");
+        }
+    }
+
+    // Ensure directory exists for new installations
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+    }
+    dir.join("pickbrain.db")
 }
 
 fn assets_path() -> PathBuf {
     PathBuf::from(env::var("WARP_ASSETS").unwrap_or_else(|_| "assets".into()))
 }
 
-fn ingest(db_name: &PathBuf) -> Result<bool> {
+pub fn ingest(db_name: &PathBuf) -> Result<bool> {
     let mut db = DB::new(db_name.clone()).unwrap();
-    let (sessions, memories, authored) = claude_code::ingest_claude_code(&mut db)?;
-    let codex_sessions = codex::ingest_codex(&mut db)?;
-    let total = sessions + memories + authored + codex_sessions;
+    
+    // We retain the old returns to preserve the print, but longer term the Ingestor trait will yield unified results
+    let (sessions, memories, authored) = ingest::claude_code::ingest_claude_code(&mut db)?;
+    let codex_sessions = ingest::codex::ingest_codex(&mut db)?;
+    let gemini_sessions = ingest::gemini::ingest_gemini(&mut db)?;
+    
+    let total = sessions + memories + authored + codex_sessions + gemini_sessions;
     if total == 0 {
         eprintln!("No new sessions to ingest.");
         return Ok(false);
     }
     eprintln!(
-        "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {memories} memory files, {authored} authored files"
+        "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {gemini_sessions} gemini sessions, {memories} memory files, {authored} authored files"
     );
     Ok(true)
 }
 
-fn embed_and_index(db: &DB, embedder: &Embedder, device: &candle_core::Device) -> Result<()> {
+pub fn embed_and_index(db: &DB, embedder: &Embedder, device: &candle_core::Device) -> Result<()> {
     let embedded = witchcraft::embed_chunks(db, embedder, None)?;
     if embedded > 0 {
         witchcraft::index_chunks(db, device)?;
@@ -61,31 +90,31 @@ fn embed_and_index(db: &DB, embedder: &Embedder, device: &candle_core::Device) -
 
 // --- Search result data ---
 
-struct TurnMeta {
-    role: String,
-    timestamp: String,
-    byte_offset: u64,
-    byte_len: u64,
+pub struct TurnMeta {
+    pub role: String,
+    pub timestamp: String,
+    pub byte_offset: u64,
+    pub byte_len: u64,
 }
 
-struct SearchResult {
-    timestamp: String,
-    project: String,
-    session_id: String,
-    turn: u64,
-    path: String,
-    cwd: String,
-    source: String,
-    bodies: Vec<String>,
-    match_idx: usize,
-    turns: Vec<TurnMeta>,
+pub struct SearchResult {
+    pub timestamp: String,
+    pub project: String,
+    pub session_id: String,
+    pub turn: u64,
+    pub path: String,
+    pub cwd: String,
+    pub source: String,
+    pub bodies: Vec<String>,
+    pub match_idx: usize,
+    pub turns: Vec<TurnMeta>,
 }
 
 // A turn from the original JSONL session file
-struct SessionTurn {
-    role: String,
-    text: String,
-    timestamp: String,
+pub struct SessionTurn {
+    pub role: String,
+    pub text: String,
+    pub timestamp: String,
 }
 
 fn read_jsonl_line(path: &str, offset: u64, len: u64) -> Option<String> {
@@ -97,7 +126,7 @@ fn read_jsonl_line(path: &str, offset: u64, len: u64) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
-fn read_turn_at(path: &str, source: &str, tm: &TurnMeta) -> Option<SessionTurn> {
+pub fn read_turn_at(path: &str, source: &str, tm: &TurnMeta) -> Option<SessionTurn> {
     let line = read_jsonl_line(path, tm.byte_offset, tm.byte_len)?;
     let v: serde_json::Value = serde_json::from_str(&line).ok()?;
 
@@ -114,6 +143,12 @@ fn read_turn_at(path: &str, source: &str, tm: &TurnMeta) -> Option<SessionTurn> 
             texts.join("\n")
         } else if ptype == "agent_reasoning" {
             payload.get("text")?.as_str()?.to_string()
+        } else {
+            return None;
+        }
+    } else if source == "gemini" {
+        if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
+            content.to_string()
         } else {
             return None;
         }
@@ -143,33 +178,86 @@ fn read_turn_at(path: &str, source: &str, tm: &TurnMeta) -> Option<SessionTurn> 
 }
 
 
-fn run_search(
+pub fn run_search(
     db_name: &PathBuf,
     assets: &PathBuf,
     q: &str,
     session: Option<&str>,
 ) -> Result<(Vec<SearchResult>, u128)> {
-    use witchcraft::types::*;
     let device = witchcraft::make_device();
     let embedder = witchcraft::Embedder::new(&device, assets)?;
-
     let mut cache = witchcraft::EmbeddingsCache::new(1);
     let db = DB::new_reader(db_name.clone()).unwrap();
-    let sql_filter = session.map(|id| SqlStatementInternal {
-        statement_type: SqlStatementType::Condition,
-        condition: Some(SqlConditionInternal {
-            key: "$.session_id".to_string(),
-            operator: SqlOperator::Equals,
-            value: Some(SqlValue::String(id.to_string())),
-        }),
-        logic: None,
-        statements: None,
-    });
+    run_search_with(&db, &embedder, &mut cache, q, session, None, None)
+}
+
+pub fn run_search_with(
+    db: &DB,
+    embedder: &witchcraft::Embedder,
+    cache: &mut witchcraft::EmbeddingsCache,
+    q: &str,
+    session_id: Option<&str>,
+    project: Option<&str>,
+    source: Option<&str>,
+) -> Result<(Vec<SearchResult>, u128)> {
+    use witchcraft::types::*;
+    
+    let mut filters = Vec::new();
+    if let Some(sid) = session_id {
+        filters.push(SqlStatementInternal {
+            statement_type: SqlStatementType::Condition,
+            condition: Some(SqlConditionInternal {
+                key: "$.session_id".to_string(),
+                operator: SqlOperator::Equals,
+                value: Some(SqlValue::String(sid.to_string())),
+            }),
+            logic: None,
+            statements: None,
+        });
+    }
+    if let Some(proj) = project {
+        filters.push(SqlStatementInternal {
+            statement_type: SqlStatementType::Condition,
+            condition: Some(SqlConditionInternal {
+                key: "$.project".to_string(),
+                operator: SqlOperator::Equals,
+                value: Some(SqlValue::String(proj.to_string())),
+            }),
+            logic: None,
+            statements: None,
+        });
+    }
+    if let Some(src) = source {
+        filters.push(SqlStatementInternal {
+            statement_type: SqlStatementType::Condition,
+            condition: Some(SqlConditionInternal {
+                key: "$.source".to_string(),
+                operator: SqlOperator::Equals,
+                value: Some(SqlValue::String(src.to_string())),
+            }),
+            logic: None,
+            statements: None,
+        });
+    }
+
+    let sql_filter = if filters.is_empty() {
+        None
+    } else if filters.len() == 1 {
+        Some(filters.remove(0))
+    } else {
+        Some(SqlStatementInternal {
+            statement_type: SqlStatementType::Group,
+            condition: None,
+            logic: Some(SqlLogic::And),
+            statements: Some(filters),
+        })
+    };
+
     let now = std::time::Instant::now();
     let results = witchcraft::search(
-        &db,
-        &embedder,
-        &mut cache,
+        db,
+        embedder,
+        cache,
         q,
         0.5,
         10,
@@ -782,9 +870,7 @@ fn parse_range(s: &str) -> (usize, usize) {
     }
 }
 
-fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>) -> Result<()> {
-    let db = DB::new_reader(db_name.clone()).unwrap();
-
+pub fn fetch_session_text(db: &DB, session_id: &str, turns_range: Option<&str>) -> Result<String> {
     let (turn_start, turn_end) = turns_range.map(parse_range).unwrap_or((0, usize::MAX));
 
     let mut stmt = db.query(
@@ -801,8 +887,7 @@ fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>) -> Resul
         .collect();
 
     if rows.is_empty() {
-        eprintln!("No session found for {session_id}");
-        std::process::exit(1);
+        return Err(anyhow::anyhow!("No session found for {session_id}"));
     }
 
     let mut buf = Vec::new();
@@ -823,8 +908,18 @@ fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>) -> Resul
         writeln!(buf, "---")?;
     }
 
-    use std::io::IsTerminal;
     let output = String::from_utf8(buf)?;
+    Ok(output)
+}
+
+fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>) -> Result<()> {
+    let db = DB::new_reader(db_name.clone()).unwrap();
+    let output = fetch_session_text(&db, session_id, turns_range).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(1);
+    });
+
+    use std::io::IsTerminal;
     if std::io::stdout().is_terminal() {
         use std::process::{Command, Stdio};
         let mut pager = Command::new("less")
@@ -847,9 +942,13 @@ fn main() -> Result<()> {
     let mut dump_session: Option<String> = None;
     let mut turns_range: Option<String> = None;
     let mut query_args: Vec<&str> = Vec::new();
+    let mut is_mcp = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "mcp" | "--mcp" => {
+                is_mcp = true;
+            }
             "--nuke" => {
                 let db_name = db_path();
                 if db_name.exists() {
@@ -860,6 +959,7 @@ fn main() -> Result<()> {
                 }
                 watermark::remove(&watermark::claude_path());
                 watermark::remove(&watermark::codex_path());
+                watermark::remove(&watermark::gemini_path());
                 std::process::exit(0);
             }
             "--session" => {
@@ -895,7 +995,11 @@ fn main() -> Result<()> {
         }
     }
 
-    if let Some(ref sid) = dump_session {
+    if is_mcp {
+        // Disengage all terminal logs to ensure clean stdout for JSON-RPC
+        let _ = log::set_max_level(LevelFilter::Off);
+        mcp::start_server(&db_name, &assets)?;
+    } else if let Some(ref sid) = dump_session {
         dump(&db_name, sid, turns_range.as_deref())?;
     } else if !query_args.is_empty() {
         let q = query_args.join(" ");
@@ -910,6 +1014,7 @@ fn main() -> Result<()> {
     } else {
         eprintln!("Usage: pickbrain [--session UUID] <query>");
         eprintln!("       pickbrain --dump <UUID> [--turns N-M]");
+        eprintln!("       pickbrain mcp");
         eprintln!("       pickbrain --nuke");
     }
     Ok(())
