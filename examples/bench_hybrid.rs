@@ -1,6 +1,6 @@
 use std::time::Instant;
 use witchcraft::Embedder;
-use candle_core::{Device, Tensor};
+use candle_core::Device;
 
 fn main() -> anyhow::Result<()> {
     let device = Device::Cpu;

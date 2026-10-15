@@ -47,7 +47,7 @@ pub fn handle_tool_call(
     params: Option<Value>,
     db: &witchcraft::DB,
     embedder: &witchcraft::Embedder,
-    cache: &mut witchcraft::EmbeddingsCache,
+    _cache: &mut witchcraft::EmbeddingsCache,
 ) -> Result<Value, String> {
     match name {
         "search_ai_history" => {
@@ -56,10 +56,16 @@ pub fn handle_tool_call(
             let proj = params.as_ref().and_then(|p| p.get("project")).and_then(|s| s.as_str());
             let src = params.as_ref().and_then(|p| p.get("source")).and_then(|s| s.as_str());
 
-            match crate::run_search_with(db, embedder, cache, q, sid, proj, src) {
+            let types: Vec<String> = src.map(|s| vec![s.to_string()]).unwrap_or_default();
+
+            match crate::run_search_with(db, embedder, q, sid, None, &[], None, &types, false, false, false) {
                 Ok((results, _ms)) => {
                     let mut formatted = String::new();
-                    for r in results.iter().take(5) {
+                    let filtered: Box<dyn Iterator<Item = &crate::SearchResult>> = match proj {
+                        Some(p) => Box::new(results.iter().filter(move |r| r.project == p)),
+                        None => Box::new(results.iter()),
+                    };
+                    for r in filtered.take(5) {
                         // Smart Context: Grouped by interaction naturally by Ingestor bodies
                         let interaction = r.bodies.get(r.match_idx).map(|s| s.as_str()).unwrap_or("");
                         formatted.push_str(&format!(
@@ -78,7 +84,7 @@ pub fn handle_tool_call(
         "read_session" => {
             let sid = params.as_ref().and_then(|p| p.get("session_id")).and_then(|s| s.as_str());
             if let Some(session_id) = sid {
-                match crate::fetch_session_text(db, session_id, None) {
+                match crate::fetch_session_text(db, session_id, None, None) {
                     Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
                     Err(e) => Err(format!("Failed to read session {}: {}", session_id, e))
                 }

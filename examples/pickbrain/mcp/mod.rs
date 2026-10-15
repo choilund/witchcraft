@@ -30,8 +30,6 @@ pub struct JsonRpcResponse {
 pub mod tools;
 
 pub fn start_server(db_name: &std::path::PathBuf, assets: &std::path::PathBuf) -> Result<()> {
-    crate::watcher::spawn_indexing_thread(db_name.clone(), assets.clone());
-
     let device = witchcraft::make_device();
     let embedder = witchcraft::Embedder::new(&device, assets)?;
     let mut cache = witchcraft::EmbeddingsCache::new(1);

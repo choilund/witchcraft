@@ -17,7 +17,7 @@ echo
 # Check prerequisites
 if [ ! -f "$WARP_CLI" ]; then
     echo "Error: warp-cli not found at $WARP_CLI"
-    echo "Build with: cargo build --release --features t5-quantized,metal,accelerate --bin warp-cli"
+    echo "Build with: make warp-cli"
     exit 1
 fi
 
@@ -31,6 +31,9 @@ if ! command -v mdfind &> /dev/null; then
     echo "Error: mdfind (Spotlight) not found - this requires macOS"
     exit 1
 fi
+
+# Decompress dataset if needed
+[ -f "datasets/nfcorpus.tsv" ] || zstd -dk "datasets/nfcorpus.tsv.zst"
 
 # Check if Warp DB is initialized
 if [ ! -f "mydb.sqlite" ]; then
@@ -81,11 +84,11 @@ echo "============================================"
 echo
 
 echo "=== Warp NDCG@10 ==="
-python3 score.py warp-results.txt "$BEIR_DIR/collection_map.json" "$BEIR_DIR/qrels.test.json"
+cargo run --quiet --release -p trec-score -- warp-results.txt "$BEIR_DIR/collection_map.json" "$BEIR_DIR/qrels.test.json"
 
 echo
 echo "=== Spotlight NDCG@10 ==="
-python3 score.py spotlight-results.txt "$BEIR_DIR/collection_map.json" "$BEIR_DIR/qrels.test.json"
+cargo run --quiet --release -p trec-score -- spotlight-results.txt "$BEIR_DIR/collection_map.json" "$BEIR_DIR/qrels.test.json"
 
 echo
 echo "============================================"

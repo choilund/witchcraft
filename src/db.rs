@@ -1,19 +1,55 @@
 use super::types::SqlStatementInternal;
+use super::app_id::APP_ID;
+use super::document_cache_hash;
 use iso8601_timestamp::Timestamp;
 use log::{error, warn};
-use rusqlite::{params_from_iter, Connection, OpenFlags, Result as SQLResult, Statement};
-use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use rusqlite::{
+    params_from_iter, Connection, OpenFlags, OptionalExtension, Result as SQLResult, Statement,
+};
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use super::sql_generator::build_filter_sql_and_params;
 
-const HASH_CHARS: usize = 32; // we'll use sha256 truncated at 128 bits/32 characters
+const SCHEMA_VERSION: i32 = 15;
+const HASH_CHARS: usize = 32;
+const MAX_SQLITE_ROWID: u64 = i64::MAX as u64;
+const ENGLISH_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is",
+    "it", "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there",
+    "these", "they", "this", "to", "was", "will", "with",
+];
+
+fn english_stopword_values_sql() -> String {
+    ENGLISH_STOPWORDS
+        .iter()
+        .map(|word| format!("('{word}')"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn invalid_input_error(message: String) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message,
+    )))
+}
+
+fn sqlite_rowid_from_u64(rowid: u64) -> SQLResult<i64> {
+    if rowid == 0 || rowid > MAX_SQLITE_ROWID {
+        return Err(invalid_input_error(format!(
+            "document rowid {rowid} must be between 1 and {MAX_SQLITE_ROWID}"
+        )));
+    }
+    Ok(rowid as i64)
+}
 
 pub struct DB {
     db_fn: PathBuf,
     connection: Option<Connection>,
     remove_on_shutdown: bool,
+    recreated: bool,
+    read_only: bool,
 }
 
 impl DB {
@@ -21,146 +57,402 @@ impl DB {
         self.connection.as_ref().expect("Connection should exist")
     }
 
+    pub fn was_recreated(&self) -> bool {
+        self.recreated
+    }
+
+    pub fn path(&self) -> &PathBuf {
+        &self.db_fn
+    }
+
+    fn sidecar_path(db_fn: &Path, suffix: &str) -> PathBuf {
+        let mut path = db_fn.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    }
+
+    fn bucket_data_prefix(db_fn: &Path) -> String {
+        let base = db_fn
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "warp.sqlite".into());
+        format!("{base}.buckets.")
+    }
+
+    fn rowids_prefix(db_fn: &Path) -> String {
+        let base = db_fn
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "warp.sqlite".into());
+        format!("{base}.rowids.")
+    }
+
+    fn rowids_buffer_file(db_fn: &Path) -> String {
+        let base = db_fn
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "warp.sqlite".into());
+        format!("{base}.rowids.buffer")
+    }
+
+    fn index_manifest_file(db_fn: &Path) -> String {
+        let base = db_fn
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "warp.sqlite".into());
+        format!("{base}.index")
+    }
+
+    fn db_parent(db_fn: &Path) -> &Path {
+        match db_fn.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        }
+    }
+
+    fn remove_sidecars(db_fn: &Path) {
+        let _ = std::fs::remove_file(Self::sidecar_path(db_fn, "-wal"));
+        let _ = std::fs::remove_file(Self::sidecar_path(db_fn, "-shm"));
+    }
+
+    fn remove_bucket_data_sidecars(db_fn: &Path) {
+        let parent = Self::db_parent(db_fn);
+        let prefix = Self::bucket_data_prefix(db_fn);
+        let rowids_prefix = Self::rowids_prefix(db_fn);
+        let rowids_buffer = Self::rowids_buffer_file(db_fn);
+        let manifest = Self::index_manifest_file(db_fn);
+        let old_prefix = Self::old_residuals_prefix(db_fn);
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix)
+                || name.starts_with(&rowids_prefix)
+                || name == rowids_buffer
+                || name == manifest
+                || name.starts_with(&old_prefix)
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    fn old_residuals_prefix(db_fn: &Path) -> String {
+        let base = db_fn
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "warp.sqlite".into());
+        format!("{base}.residuals.")
+    }
+
+    fn configure(connection: &Connection) -> SQLResult<()> {
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.pragma_update(None, "mmap_size", 512 * 1024 * 1024)?;
+        Ok(())
+    }
+
+    fn schema_matches(connection: &Connection) -> bool {
+        let app_id: SQLResult<i32> =
+            connection.query_row("PRAGMA application_id;", [], |r| r.get(0));
+        let user_version: SQLResult<i32> =
+            connection.query_row("PRAGMA user_version;", [], |r| r.get(0));
+        matches!(
+            (app_id, user_version),
+            (Ok(a), Ok(v)) if a == APP_ID && v == SCHEMA_VERSION
+        )
+    }
+
+    fn create_schema(connection: &Connection) -> SQLResult<()> {
+        let stopword_values = english_stopword_values_sql();
+        connection.execute_batch(&format!(
+            "PRAGMA application_id = {APP_ID};
+             PRAGMA user_version = {SCHEMA_VERSION};
+
+             CREATE TABLE document(
+                 uuid TEXT NOT NULL PRIMARY KEY,
+                 date TEXT NOT NULL,
+                 metadata JSON,
+                 hash TEXT CHECK (hash IS NULL OR length(hash) = {HASH_CHARS}),
+                 body TEXT,
+                 lens TEXT);
+
+             CREATE INDEX document_index ON document(hash);
+             CREATE INDEX document_nonempty_hash_index
+                 ON document(hash)
+                 WHERE length(body) > 0;
+
+             CREATE VIRTUAL TABLE document_fts
+                 USING fts5(body, content='document', content_rowid='rowid',
+                            tokenize='porter unicode61');
+             INSERT INTO document_fts(document_fts) VALUES('rebuild');
+
+             CREATE TABLE document_fts_stopword(
+                 term TEXT NOT NULL PRIMARY KEY
+             ) WITHOUT ROWID;
+             INSERT INTO document_fts_stopword(term) VALUES {stopword_values};
+
+             CREATE TRIGGER document_fts_insert AFTER INSERT ON document
+             BEGIN
+                 INSERT INTO document_fts(rowid, body) VALUES (new.rowid, new.body);
+             END;
+
+             CREATE TRIGGER document_fts_delete AFTER DELETE ON document
+             BEGIN
+                 INSERT INTO document_fts(document_fts, rowid, body)
+                     VALUES('delete', old.rowid, old.body);
+             END;
+
+             CREATE TRIGGER document_fts_update AFTER UPDATE ON document
+             BEGIN
+                 INSERT INTO document_fts(document_fts, rowid, body)
+                     VALUES('delete', old.rowid, old.body);
+                 INSERT INTO document_fts(rowid, body) VALUES (new.rowid, new.body);
+             END;
+
+             CREATE TABLE chunk(
+                 hash TEXT PRIMARY KEY CHECK (length(hash) = {HASH_CHARS}),
+                 model TEXT NOT NULL,
+                 embeddings BLOB NOT NULL,
+                 counts TEXT NOT NULL,
+                 embedding_count INTEGER NOT NULL);
+             CREATE INDEX chunk_hash_model_embedding_count_index
+                 ON chunk(hash, model, embedding_count);
+
+             CREATE TRIGGER document_after_delete AFTER DELETE ON document
+             BEGIN
+                 DELETE FROM chunk
+                     WHERE hash = old.hash
+                     AND NOT EXISTS (SELECT 1 FROM document WHERE hash = old.hash);
+             END;
+
+             CREATE TRIGGER document_after_update AFTER UPDATE ON document
+             BEGIN
+                 DELETE FROM chunk
+                     WHERE hash = old.hash
+                     AND NOT EXISTS (SELECT 1 FROM document WHERE hash = old.hash);
+             END;
+
+             "
+        ))?;
+        Ok(())
+    }
+
+    fn has_column(connection: &Connection, table: &str, column: &str) -> SQLResult<bool> {
+        let mut query = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns = query.query_map((), |row| row.get::<_, String>(1))?;
+        for result in columns {
+            if result? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn backfill_document_hashes(connection: &Connection) -> SQLResult<()> {
+        let rows = {
+            let mut query = connection.prepare(
+                "SELECT rowid, IFNULL(body, ''), IFNULL(lens, '')
+                 FROM document
+                 WHERE hash IS NULL OR length(hash) != ?1",
+            )?;
+            let rows = query
+                .query_map((HASH_CHARS as i64,), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<SQLResult<Vec<_>>>()?;
+            rows
+        };
+
+        let mut update = connection.prepare("UPDATE document SET hash = ?1 WHERE rowid = ?2")?;
+        for (rowid, body, lens) in rows {
+            let hash = document_cache_hash(&body, &lens);
+            update.execute((&hash, rowid))?;
+        }
+        Ok(())
+    }
+
+    fn backfill_chunk_embedding_counts(connection: &Connection) -> SQLResult<()> {
+        let rows = {
+            let mut query = connection.prepare(
+                "SELECT hash, counts FROM chunk WHERE embedding_count = 0",
+            )?;
+            let rows = query
+                .query_map((), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<SQLResult<Vec<_>>>()?;
+            rows
+        };
+
+        let mut update = connection.prepare("UPDATE chunk SET embedding_count = ?1 WHERE hash = ?2")?;
+        for (hash, counts) in rows {
+            let embedding_count: usize = counts
+                .split(',')
+                .filter_map(|count| count.parse::<usize>().ok())
+                .sum();
+            update.execute((embedding_count as i64, hash))?;
+        }
+        Ok(())
+    }
+
+    fn ensure_chunk_schema(connection: &Connection) -> SQLResult<()> {
+        if !Self::has_column(connection, "document", "hash")? {
+            connection.execute_batch(&format!(
+                "ALTER TABLE document
+                 ADD COLUMN hash TEXT CHECK (hash IS NULL OR length(hash) = {HASH_CHARS});",
+            ))?;
+        }
+        Self::backfill_document_hashes(connection)?;
+
+        connection.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS document_index ON document(hash);
+             CREATE INDEX IF NOT EXISTS document_nonempty_hash_index
+                 ON document(hash)
+                 WHERE length(body) > 0;
+
+             CREATE TABLE IF NOT EXISTS chunk(
+                 hash TEXT PRIMARY KEY CHECK (length(hash) = {HASH_CHARS}),
+                 model TEXT NOT NULL,
+                 embeddings BLOB NOT NULL,
+                 counts TEXT NOT NULL,
+                 embedding_count INTEGER NOT NULL DEFAULT 0);
+             CREATE INDEX IF NOT EXISTS chunk_hash_model_embedding_count_index
+                 ON chunk(hash, model, embedding_count);
+
+             CREATE TRIGGER IF NOT EXISTS document_after_delete AFTER DELETE ON document
+             BEGIN
+                 DELETE FROM chunk
+                     WHERE hash = old.hash
+                     AND NOT EXISTS (SELECT 1 FROM document WHERE hash = old.hash);
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS document_after_update AFTER UPDATE ON document
+             BEGIN
+                 DELETE FROM chunk
+                     WHERE hash = old.hash
+                     AND NOT EXISTS (SELECT 1 FROM document WHERE hash = old.hash);
+             END;",
+        ))?;
+
+        if !Self::has_column(connection, "chunk", "embedding_count")? {
+            connection.execute_batch(
+                "ALTER TABLE chunk
+                 ADD COLUMN embedding_count INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        Self::backfill_chunk_embedding_counts(connection)?;
+        Ok(())
+    }
+
+    fn ensure_document_index_tombstone_schema(connection: &Connection) -> SQLResult<()> {
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS document_index_tombstone(
+                 rowid INTEGER NOT NULL PRIMARY KEY
+             );
+
+             CREATE TRIGGER IF NOT EXISTS document_index_tombstone_delete
+             AFTER DELETE ON document
+             BEGIN
+                 INSERT OR IGNORE INTO document_index_tombstone(rowid)
+                     VALUES(old.rowid);
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS document_index_tombstone_rowid_update
+             AFTER UPDATE ON document
+             WHEN old.rowid != new.rowid
+             BEGIN
+                 INSERT OR IGNORE INTO document_index_tombstone(rowid)
+                     VALUES(old.rowid);
+             END;",
+        )?;
+        Ok(())
+    }
+
     pub fn new_reader(db_fn: PathBuf) -> SQLResult<Self> {
         let connection =
             Connection::open_with_flags(db_fn.clone(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.pragma_update(None, "mmap_size", 512 * 1024 * 1024)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
             db_fn,
             connection: Some(connection),
             remove_on_shutdown: false,
+            recreated: false,
+            read_only: true,
         })
     }
 
-    pub fn new(db_fn: PathBuf) -> SQLResult<Self> {
-        const APP_ID: i32 = 0x07DB_DA55;
-        const EXPECTED_VERSION: i32 = 6;
-
-        let mut first_creation = !db_fn.exists();
-        let connection = Connection::open(&db_fn)?;
-
+    fn integrity_ok(connection: &Connection) -> bool {
         let status: SQLResult<String> =
             connection.query_row("PRAGMA quick_check;", [], |row| row.get(0));
-        let db_ok = match status {
-            Ok(text) => text.trim().eq_ignore_ascii_case("ok"),
-            Err(_e) => false,
-        };
+        matches!(status, Ok(text) if text.trim().eq_ignore_ascii_case("ok"))
+    }
 
-        let schema_ok = if first_creation {
-            true
-        } else {
-            let app_id: SQLResult<i32> =
-                connection.query_row("PRAGMA application_id;", [], |r| r.get(0));
-            let user_version: SQLResult<i32> =
-                connection.query_row("PRAGMA user_version;", [], |r| r.get(0));
-            matches!((app_id, user_version),
-                (Ok(a), Ok(v)) if a == APP_ID && v == EXPECTED_VERSION && a != 0 && v != 0
-            )
-        };
+    fn open_internal(db_fn: PathBuf, fast: bool) -> SQLResult<Self> {
+        let mut first_creation = !db_fn.exists();
+        let mut connection = Connection::open(&db_fn)?;
 
-        let connection = if db_ok && schema_ok {
-            connection
-        } else {
+        let db_ok = fast || first_creation || Self::integrity_ok(&connection);
+        let schema_ok = first_creation || Self::schema_matches(&connection);
+
+        let mut recreated = false;
+        if !db_ok || !schema_ok {
             warn!(
-                "warp database {} corrupted or schema mismatch, recreating it!",
-                db_fn.display()
+                "warp database {} {}, recreating!",
+                db_fn.display(),
+                if !db_ok { "corrupted" } else { "schema mismatch" }
             );
+            recreated = !first_creation;
             connection.close().map_err(|(_conn, e)| e)?;
             std::fs::remove_file(&db_fn)
                 .map_err(|_e| rusqlite::Error::InvalidPath(db_fn.clone()))?;
-            let _ = std::fs::remove_file(db_fn.with_extension("wal"));
-            let _ = std::fs::remove_file(db_fn.with_extension("shm"));
+            Self::remove_sidecars(&db_fn);
+            Self::remove_bucket_data_sidecars(&db_fn);
+            connection = Connection::open(&db_fn)?;
             first_creation = true;
-
-            Connection::open(&db_fn)?
-        };
-
-        if first_creation {
-            connection.execute_batch(&format!(
-                "PRAGMA application_id = {APP_ID}; PRAGMA user_version = {EXPECTED_VERSION}"
-            ))?;
         }
 
-        // Enable WAL mode for better concurrency and performance
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        Self::configure(&connection)?;
 
-        let query = format!(
-            "CREATE TABLE IF NOT EXISTS document(uuid TEXT NOT NULL PRIMARY KEY,
-            date TEXT NOT NULL,
-            metadata JSON, hash TEXT
-            CHECK (length(hash) = {HASH_CHARS}),
-            body TEXT,
-            lens TEXT)"
-        );
-        connection.execute(&query, ())?;
+        if first_creation {
+            Self::create_schema(&connection)?;
+        }
+        Self::ensure_chunk_schema(&connection)?;
+        Self::ensure_document_index_tombstone_schema(&connection)?;
 
-        let query = "CREATE INDEX IF NOT EXISTS document_uuid_index ON document(uuid)";
-        connection.execute(query, ())?;
-
-        let query = "CREATE INDEX IF NOT EXISTS document_index ON document(hash)";
-        connection.execute(query, ())?;
-
-        let query = "CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(body, content='document', content_rowid='rowid')";
-        connection.execute(query, ())?;
-
-        let query = "INSERT INTO document_fts(document_fts) VALUES('rebuild')";
-        connection.execute(query, ())?;
-
-        let query = format!(
-            "CREATE TABLE IF NOT EXISTS chunk(hash TEXT PRIMARY KEY
-            CHECK (length(hash) = {HASH_CHARS}),
-            model TEXT,
-            embeddings BLOB NOT NULL,
-            counts TEXT NOT NULL)"
-        );
-        connection.execute(&query, ())?;
-
-        let query = "CREATE INDEX IF NOT EXISTS chunk_index ON chunk(hash)";
-        connection.execute(query, ())?;
-
-        let query = "CREATE TRIGGER IF NOT EXISTS document_after_delete
-            AFTER DELETE ON document
-            BEGIN
-              DELETE FROM chunk
-              WHERE hash = OLD.hash
-                AND NOT EXISTS (SELECT 1 FROM document WHERE hash = OLD.hash);
-            END";
-        connection.execute(query, ())?;
-
-        let query = "CREATE TRIGGER IF NOT EXISTS document_after_update
-            AFTER UPDATE ON document
-            BEGIN
-              DELETE FROM chunk
-              WHERE hash = OLD.hash
-                AND NOT EXISTS (SELECT 1 FROM document WHERE hash = OLD.hash);
-            END";
-        connection.execute(query, ())?;
-
-        let query = "CREATE TABLE IF NOT EXISTS bucket(id INTEGER PRIMARY KEY,
-            center BLOB NOT NULL, indices BLOB NOT NULL, residuals BLOB NOT NULL)";
-        connection.execute(query, ())?;
-
-        let query =
-            "CREATE TABLE IF NOT EXISTS indexed_chunk(chunkid INTEGER PRIMARY KEY NOT NULL)";
-        connection.execute(query, ())?;
         Ok(Self {
             db_fn,
             connection: Some(connection),
             remove_on_shutdown: false,
+            recreated,
+            read_only: false,
         })
+    }
+
+    /// Open with integrity check — safe for in-process use.
+    pub fn new(db_fn: PathBuf) -> SQLResult<Self> {
+        Self::open_internal(db_fn, false)
+    }
+
+    /// Open without integrity check — for CLI batch operations where startup
+    /// latency on large databases is prohibitive.
+    pub fn new_fast(db_fn: PathBuf) -> SQLResult<Self> {
+        Self::open_internal(db_fn, true)
     }
 
     fn clear_inner(&mut self) -> SQLResult<()> {
         self.execute("DELETE FROM document")?;
+        self.execute("DELETE FROM document_index_tombstone")?;
         self.execute("DELETE FROM chunk")?;
-        self.execute("DELETE FROM bucket")?;
-        self.execute("DELETE FROM indexed_chunk")?;
+        self.remove_all_bucket_data_sidecars();
         self.execute("VACUUM")?;
-        Ok(())
-    }
-
-    pub fn refresh_ft(&mut self) -> SQLResult<()> {
-        self.execute("INSERT INTO document_fts(document_fts) VALUES('rebuild')")?;
         Ok(())
     }
 
@@ -200,7 +492,9 @@ impl DB {
         if let Some(connection) = self.connection.take() {
             // Checkpoint and truncate the WAL file so the main .sqlite file is
             // self-contained on exit (no stale -wal / -shm files left behind).
-            Self::checkpoint_internal(&connection, false);
+            if !self.read_only {
+                Self::checkpoint_internal(&connection, false);
+            }
             match connection.close() {
                 Ok(_) => {}
                 Err((conn, e)) => {
@@ -225,21 +519,27 @@ impl DB {
             };
 
             // Also remove WAL and SHM files if they exist
-            let _ = std::fs::remove_file(self.db_fn.with_extension("wal"));
-            let _ = std::fs::remove_file(self.db_fn.with_extension("shm"));
+            Self::remove_sidecars(&self.db_fn);
+            Self::remove_bucket_data_sidecars(&self.db_fn);
         }
     }
 
     /// Checkpoint and truncate the WAL into the main database file.
     /// Safe to call at any point when no statements are active on this connection.
     pub fn checkpoint(&self) {
-        if let Some(connection) = self.connection.as_ref() {
-            Self::checkpoint_internal(connection, true);
+        if !self.read_only {
+            if let Some(connection) = self.connection.as_ref() {
+                Self::checkpoint_internal(connection, true);
+            }
         }
     }
 
     pub fn file_size(&self) -> std::io::Result<u64> {
         std::fs::metadata(&self.db_fn).map(|meta| meta.len())
+    }
+
+    pub fn remove_all_bucket_data_sidecars(&self) {
+        Self::remove_bucket_data_sidecars(&self.db_fn);
     }
 
     pub fn execute(&self, sql: &str) -> SQLResult<()> {
@@ -273,51 +573,116 @@ impl DB {
 
     pub fn add_doc(
         &mut self,
+        rowid: Option<u64>,
         uuid: &Uuid,
         date: Option<Timestamp>,
         metadata: &str,
         body: &str,
         lens: Option<Vec<usize>>,
     ) -> SQLResult<()> {
-        let lens = match lens {
-            Some(lens) => lens,
-            None => [body.chars().count()].to_vec(),
-        };
+        self.add_docs_batch(&[(rowid, *uuid, date, metadata, body, lens)])?;
+        Ok(())
+    }
 
-        let total: usize = lens.iter().copied().sum();
-        if total != body.chars().count() {
-            warn!("bad length: [{} vs {}]", total, body.chars().count());
+    /// Batch-add documents in a single transaction. Prepares the statement once
+    /// and reuses it for all inserts. Much faster than individual add_doc calls.
+    pub fn add_docs_batch(
+        &mut self,
+        docs: &[(Option<u64>, Uuid, Option<Timestamp>, &str, &str, Option<Vec<usize>>)],
+    ) -> SQLResult<usize> {
+        if docs.is_empty() {
+            return Ok(0);
         }
-
-        let lens = lens
-            .iter()
-            .map(|len| len.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let mut hasher = Sha256::new();
-        hasher.update(body);
-        hasher.update(&lens);
-        let hash = format!("{:x}", hasher.finalize());
-        let hash = &hash[..HASH_CHARS];
-
-        let date = date.unwrap_or_else(Timestamp::now_utc);
-
-        self.conn().execute(
-            "INSERT INTO document VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+        let rowids = self.resolve_document_rowids(docs)?;
+        self.conn().execute("BEGIN", ())?;
+        let mut stmt = self.conn().prepare(
+            "INSERT INTO document(rowid, uuid, date, metadata, hash, body, lens)
+            VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
             ON CONFLICT(uuid) DO UPDATE SET
-                date = ?2, metadata = ?3, hash = ?4, body = ?5, lens = ?6",
-            (
+                rowid = ?1, date = ?3, metadata = ?4, hash = ?5, body = ?6, lens = ?7",
+        )?;
+
+        let mut count = 0;
+        for ((_, uuid, date, metadata, body, lens), rowid) in docs.iter().zip(rowids.iter()) {
+            let lens = match lens {
+                Some(lens) => lens.clone(),
+                None => vec![body.chars().count()],
+            };
+            let total: usize = lens.iter().copied().sum();
+            if total != body.chars().count() {
+                warn!("bad length: [{} vs {}]", total, body.chars().count());
+            }
+            let lens_str = lens
+                .iter()
+                .map(|len| len.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let hash = document_cache_hash(body, &lens_str);
+
+            let date = date.unwrap_or_else(Timestamp::now_utc);
+            stmt.execute((
+                rowid,
                 &uuid.to_string(),
                 date.to_string(),
-                metadata,
+                *metadata,
                 &hash,
-                &body,
-                &lens,
-            ),
-        )?;
+                *body,
+                &lens_str,
+            ))?;
+            count += 1;
+        }
+        drop(stmt);
+        self.conn().execute("COMMIT", ())?;
         self.remove_on_shutdown = false;
-        Ok(())
+        Ok(count)
+    }
+
+    fn resolve_document_rowids(
+        &self,
+        docs: &[(Option<u64>, Uuid, Option<Timestamp>, &str, &str, Option<Vec<usize>>)],
+    ) -> SQLResult<Vec<i64>> {
+        let mut previous = self.max_known_document_rowid()?;
+        let mut rowid_query = self
+            .conn()
+            .prepare("SELECT rowid FROM document WHERE uuid = ?1")?;
+        let mut rowids = Vec::with_capacity(docs.len());
+
+        for (rowid, uuid, _, _, _, _) in docs {
+            let rowid = match rowid {
+                Some(rowid) => {
+                    let rowid = sqlite_rowid_from_u64(*rowid)?;
+                    if rowid <= previous {
+                        return Err(invalid_input_error(format!(
+                            "document rowid {rowid} must be greater than previous rowid {previous}"
+                        )));
+                    }
+                    previous = rowid;
+                    rowid
+                }
+                None => match rowid_query
+                    .query_row((uuid.to_string(),), |row| row.get::<_, i64>(0))
+                    .optional()?
+                {
+                    Some(existing) => existing,
+                    None => {
+                        previous = previous.checked_add(1).ok_or_else(|| {
+                            invalid_input_error("document rowid space exhausted".to_string())
+                        })?;
+                        previous
+                    }
+                },
+            };
+            rowids.push(rowid);
+        }
+
+        Ok(rowids)
+    }
+
+    fn max_known_document_rowid(&self) -> SQLResult<i64> {
+        self.conn()
+            .query_row("SELECT IFNULL(MAX(rowid), 0) FROM document", (), |row| {
+                row.get(0)
+            })
     }
 
     pub fn remove_doc(&mut self, uuid: &Uuid) -> SQLResult<()> {
@@ -326,47 +691,14 @@ impl DB {
         Ok(())
     }
 
-    pub fn add_chunk(
-        &self,
-        hash: &str,
-        model: &str,
-        embeddings: &Vec<u8>,
-        counts: &str,
-    ) -> SQLResult<()> {
-        self.conn().execute(
-            "INSERT OR IGNORE INTO chunk VALUES(?1, ?2, ?3, ?4)",
-            (&hash, &model, embeddings, counts),
-        )?;
-        Ok(())
-    }
-
-    pub fn add_bucket(
-        &self,
-        id: u32,
-        center: &Vec<u8>,
-        indices: &Vec<u8>,
-        residuals: &Vec<u8>,
-    ) -> SQLResult<()> {
-        self.conn().execute(
-            "INSERT OR REPLACE INTO bucket VALUES(?1, ?2, ?3, ?4)",
-            (id, center, indices, residuals),
-        )?;
-        Ok(())
-    }
-
-    pub fn add_indexed_chunk(&self, chunkid: u32) -> SQLResult<()> {
-        self.conn().execute(
-            "INSERT OR REPLACE INTO indexed_chunk VALUES(?1)",
-            (chunkid,),
-        )?;
-        Ok(())
-    }
 }
 
 impl Drop for DB {
     fn drop(&mut self) {
         if let Some(connection) = self.connection.take() {
-            Self::checkpoint_internal(&connection, false);
+            if !self.read_only {
+                Self::checkpoint_internal(&connection, false);
+            }
             match connection.close() {
                 Ok(_) => {}
                 Err((conn, e)) => {
@@ -375,5 +707,64 @@ impl Drop for DB {
                 }
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DB, ENGLISH_STOPWORDS};
+    use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
+
+    #[test]
+    fn db_parent_uses_current_dir_for_bare_relative_path() {
+        assert_eq!(DB::db_parent(Path::new("mydb.sqlite")), Path::new("."));
+        assert_eq!(DB::db_parent(Path::new("data/mydb.sqlite")), Path::new("data"));
+    }
+
+    #[test]
+    fn removes_sidecars_for_bare_relative_path() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = format!("warp-sidecar-test-{nonce}.sqlite");
+        let db_path = PathBuf::from(&base);
+        let sidecar = PathBuf::from(format!("{base}.buckets.1.test"));
+        let rowids = PathBuf::from(format!("{base}.rowids.1.test"));
+        let rowids_buffer = PathBuf::from(format!("{base}.rowids.buffer"));
+        let manifest = PathBuf::from(format!("{base}.index"));
+        let old_sidecar = PathBuf::from(format!("{base}.residuals.1.test"));
+
+        std::fs::write(&sidecar, b"bucket").unwrap();
+        std::fs::write(&rowids, b"rowids").unwrap();
+        std::fs::write(&rowids_buffer, b"buffer").unwrap();
+        std::fs::write(&manifest, b"manifest").unwrap();
+        std::fs::write(&old_sidecar, b"residual").unwrap();
+        DB::remove_bucket_data_sidecars(&db_path);
+
+        assert!(!sidecar.exists());
+        assert!(!rowids.exists());
+        assert!(!rowids_buffer.exists());
+        assert!(!manifest.exists());
+        assert!(!old_sidecar.exists());
+    }
+
+    #[test]
+    fn new_database_contains_english_fts_stopwords() -> rusqlite::Result<()> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("warp.sqlite");
+        let db = DB::new(path)?;
+
+        let mut count_query = db.query("SELECT COUNT(*) FROM document_fts_stopword")?;
+        let count: i64 = count_query.query_row((), |row| row.get(0))?;
+        assert_eq!(count, ENGLISH_STOPWORDS.len() as i64);
+
+        let mut stopword_query =
+            db.query("SELECT 1 FROM document_fts_stopword WHERE term = 'the'")?;
+        let found: i64 = stopword_query.query_row((), |row| row.get(0))?;
+        assert_eq!(found, 1);
+
+        Ok(())
     }
 }

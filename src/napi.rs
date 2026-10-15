@@ -1,4 +1,4 @@
-/* Node module API for Warp */
+/* Node module API for Witchcraft */
 
 use crate::types::SqlStatement;
 use iso8601_timestamp::Timestamp;
@@ -60,18 +60,8 @@ static LOGFN: OnceCell<Box<dyn Fn(LogEvent) + Send + Sync>> = OnceCell::new();
 struct JsLogger;
 
 impl Log for JsLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        // SECURITY: Filter out openvino-finder logs below ERROR level to prevent PII leakage.
-        // openvino-finder (dependency of openvino crate) logs file paths at INFO level like:
-        // "Attempting to find library: libopenvino_c.so"
-        // "Found library at path: /Users/username/Library/..."
-        // These paths may contain usernames or other PII that must not be exposed via the
-        // logging callback. Only ERROR-level failures are allowed through.
-        if metadata.target().starts_with("openvino_finder") {
-            metadata.level() <= log::Level::Error
-        } else {
-            true
-        }
+    fn enabled(&self, _metadata: &Metadata) -> bool {
+        true
     }
 
     fn log(&self, record: &Record) {
@@ -244,6 +234,7 @@ pub fn progress_update(progress: f64, phase: &str) {
 
 enum Job {
     Add {
+        rowid: Option<u64>,
         uuid: Uuid,
         date: Option<Timestamp>,
         metadata: String,
@@ -332,15 +323,19 @@ impl Indexer {
                 if let Some(db) = db.as_mut() {
                     match job {
                         Job::Add {
+                            rowid,
                             uuid,
                             date,
                             metadata,
                             body,
                             lengths,
-                        } => match db.add_doc(&uuid, date, &metadata, &body, lengths) {
-                            Ok(()) => {}
-                            Err(v) => {
-                                warn!("add_doc failed! {}", v);
+                        } => {
+                            let result = db.add_doc(rowid, &uuid, date, &metadata, &body, lengths);
+                            match result {
+                                Ok(()) => {}
+                                Err(v) => {
+                                    warn!("add_doc failed! {}", v);
+                                }
                             }
                         },
                         Job::Remove { uuid } => match db.remove_doc(&uuid) {
@@ -350,7 +345,6 @@ impl Indexer {
                             }
                         },
                         Job::Index => {
-                            let _ = db.refresh_ft();
                             loop {
                                 match &embedder {
                                     Some(embedder) => {
@@ -376,7 +370,7 @@ impl Indexer {
                             }
                             if crate::count_unindexed_embeddings(&db).unwrap_or(0) > 1024 {
                                 let now = std::time::Instant::now();
-                                match crate::index_chunks(&db, &device) {
+                                match crate::index_chunks(&db, None, false) {
                                     Ok(()) => {}
                                     Err(v) => {
                                         warn!("index_chunks failed! {}", v);
@@ -414,6 +408,7 @@ impl Indexer {
 
     pub fn add(
         &self,
+        rowid: Option<u64>,
         uuid: Uuid,
         date: Option<Timestamp>,
         metadata: String,
@@ -422,6 +417,7 @@ impl Indexer {
     ) {
         if accepting_commands() {
             let _ = self.tx.send(Job::Add {
+                rowid,
                 uuid,
                 date,
                 metadata,
@@ -468,13 +464,13 @@ impl Indexer {
     }
 }
 
-struct WarpInner {
+struct WitchcraftInner {
     db: Option<crate::DB>,
     cache: crate::EmbeddingsCache,
     embedder: Option<crate::Embedder>,
 }
 
-impl WarpInner {
+impl WitchcraftInner {
     pub fn new(db_name: String, assets: String) -> Self {
         let _indexer = Indexer::global(db_name.clone(), assets.clone());
         let db = crate::DB::new_reader(db_name.into()).ok();
@@ -496,7 +492,7 @@ impl WarpInner {
         threshold: f32,
         top_k: usize,
         sql_filter: Option<&crate::types::SqlStatementInternal>,
-    ) -> Vec<(f32, String, String, u32)> {
+    ) -> Vec<(f32, String, Vec<String>, u32, String)> {
         self.embedder
             .as_ref()
             .and_then(|embedder| self.db.as_ref().map(|db| (embedder, db)))
@@ -507,9 +503,9 @@ impl WarpInner {
                 },
                 |(embedder, db)| {
                     let now = std::time::Instant::now();
-                    let results = crate::search(
+                    let results = crate::search_with_fulltext_prefix_wildcard(
                         db,
-                        embedder,
+                        Some(embedder),
                         &mut self.cache,
                         &q,
                         threshold,
@@ -544,15 +540,15 @@ impl WarpInner {
     }
 }
 
-static INNER: OnceLock<Arc<Mutex<WarpInner>>> = OnceLock::new();
-fn inner(db_name: String, assets: String) -> Arc<Mutex<WarpInner>> {
+static INNER: OnceLock<Arc<Mutex<WitchcraftInner>>> = OnceLock::new();
+fn inner(db_name: String, assets: String) -> Arc<Mutex<WitchcraftInner>> {
     INNER
-        .get_or_init(|| Arc::new(Mutex::new(WarpInner::new(db_name, assets))))
+        .get_or_init(|| Arc::new(Mutex::new(WitchcraftInner::new(db_name, assets))))
         .clone()
 }
 
 pub struct SearchTask {
-    inner: Arc<Mutex<WarpInner>>,
+    inner: Arc<Mutex<WitchcraftInner>>,
     q: String,
     threshold: f32,
     top_k: usize,
@@ -589,7 +585,7 @@ impl<'env> ScopedTask<'env> for SearchTask {
 }
 
 pub struct ScoreTask {
-    inner: Arc<Mutex<WarpInner>>,
+    inner: Arc<Mutex<WitchcraftInner>>,
     q: String,
     sentences: Vec<String>,
 }
@@ -613,18 +609,33 @@ impl<'env> ScopedTask<'env> for ScoreTask {
     }
 }
 
-#[napi(js_name = "Warp")]
-pub struct Warp {
+#[napi(js_name = "Witchcraft")]
+pub struct Witchcraft {
     db_name: String,
     assets: String,
     indexer: &'static Indexer,
 }
 
+fn parse_rowid(rowid: &str) -> Result<u64> {
+    let rowid = rowid.parse::<u64>().map_err(|_| {
+        Error::new(
+            Status::InvalidArg,
+            "rowid must be a positive SQLite rowid string",
+        )
+    })?;
+    if rowid == 0 || rowid > i64::MAX as u64 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "rowid must be a positive SQLite rowid string",
+        ));
+    }
+    Ok(rowid)
+}
+
 #[napi]
-impl Warp {
+impl Witchcraft {
     #[napi(constructor)]
     pub fn new(db_name: String, assets: String) -> Self {
-        let cwd = std::env::current_dir().unwrap();
         info!("warp running");
         let indexer = Indexer::global(db_name.clone(), assets.clone());
         Self {
@@ -667,7 +678,11 @@ impl Warp {
         metadata: String,
         body: String,
         lengths: Vec<u32>,
-    ) {
+        rowid: Option<String>,
+    ) -> Result<()> {
+        let rowid = rowid
+            .map(|rowid| parse_rowid(&rowid))
+            .transpose()?;
         let uuid = Uuid::parse_str(&uuid).unwrap();
         let date = Timestamp::parse(date.as_str());
 
@@ -677,7 +692,8 @@ impl Warp {
             None
         };
 
-        self.indexer.add(uuid, date, metadata, body, lengths);
+        self.indexer.add(rowid, uuid, date, metadata, body, lengths);
+        Ok(())
     }
 
     #[napi]
