@@ -13,10 +13,10 @@ def send_request(proc, request):
     return json.loads(resp_line)
 
 def main():
-    # Use the installed binary or cargo run
-    binary = os.path.expanduser("~/.cargo/bin/pickbrain")
+    # Use the installed binary or custom path
+    binary = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/.cargo/bin/pickbrain")
     if not os.path.exists(binary):
-        print(f"Error: {binary} not found. Please run 'make pickbrain-install' first.")
+        print(f"Error: {binary} not found.")
         sys.exit(1)
 
     print(f"Starting MCP server: {binary}")
