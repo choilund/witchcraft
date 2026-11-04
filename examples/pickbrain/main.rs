@@ -9,6 +9,7 @@ mod codex;
 mod pi;
 mod slack;
 mod watermark;
+mod mcp;
 
 use witchcraft::{DB, Embedder};
 
@@ -2108,20 +2109,15 @@ fn parse_range(s: &str) -> (usize, usize) {
     }
 }
 
-fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>, since_ms: Option<i64>) -> Result<()> {
+fn fetch_session_text(
+    db: &DB,
+    session_id: &str,
+    turns_range: Option<&str>,
+    since_ms: Option<i64>,
+) -> Result<String> {
     use witchcraft::types::*;
     use witchcraft::sql_generator::build_filter_sql_and_params;
 
-    let db = match DB::new_reader(db_name.clone()) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!(
-                "warning: lookup-only mode could not open {}: {e}",
-                db_name.display()
-            );
-            return Ok(());
-        }
-    };
     let name = session_id.strip_prefix('#').unwrap_or(session_id);
 
     // Try as session_id first, then thread conv_key, then channel_id/channel_name
@@ -2166,7 +2162,7 @@ fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>, since_ms
             logic: None,
             statements: None,
         };
-        let rows = query_filter(&db, &session_match, "turn", turn_start, turn_end)?;
+        let rows = query_filter(db, &session_match, "turn", turn_start, turn_end)?;
         if !rows.is_empty() {
             (rows, false)
         } else {
@@ -2181,7 +2177,7 @@ fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>, since_ms
                 logic: None,
                 statements: None,
             };
-            let rows = query_filter(&db, &thread_match, "date", turn_start, turn_end)?;
+            let rows = query_filter(db, &thread_match, "date", turn_start, turn_end)?;
             if !rows.is_empty() {
                 (rows, true)
             } else {
@@ -2245,14 +2241,13 @@ fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>, since_ms
                     statements: Some(filters),
                 }
             };
-            let rows = query_filter(&db, &combined, "turn DESC", turn_start, turn_end)?;
+            let rows = query_filter(db, &combined, "turn DESC", turn_start, turn_end)?;
             (rows, true)
         }}
     };
 
     if rows.is_empty() {
-        eprintln!("No session or channel found for {session_id}");
-        std::process::exit(1);
+        anyhow::bail!("No session or channel found for {session_id}");
     }
 
     let mut buf = Vec::new();
@@ -2278,8 +2273,30 @@ fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>, since_ms
         writeln!(buf, "---")?;
     }
 
+    Ok(String::from_utf8(buf)?)
+}
+
+fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>, since_ms: Option<i64>) -> Result<()> {
+    let db = match DB::new_reader(db_name.clone()) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!(
+                "warning: lookup-only mode could not open {}: {e}",
+                db_name.display()
+            );
+            return Ok(());
+        }
+    };
+
+    let output = match fetch_session_text(&db, session_id, turns_range, since_ms) {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
     use std::io::IsTerminal;
-    let output = String::from_utf8(buf)?;
     if std::io::stdout().is_terminal() {
         use std::process::{Command, Stdio};
         let mut pager = Command::new("less")
@@ -2319,6 +2336,7 @@ fn main() -> Result<()> {
     let mut exclude_current = false;
     let mut quiet = false;
     let mut ingest_only = false;
+    let mut is_mcp = false;
     let mut query_args: Vec<&str> = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -2327,6 +2345,7 @@ fn main() -> Result<()> {
                 eprintln!("Usage:");
                 eprintln!("  pickbrain [options] [query]");
                 eprintln!("  pickbrain --dump <session-id|channel|thr:ts> [--turns N-M] [--since T]");
+                eprintln!("  pickbrain mcp");
                 eprintln!("  pickbrain --nuke");
                 eprintln!("  pickbrain --ingest-only [--quiet]");
                 eprintln!("  pickbrain --watch [--delay SECONDS] [--max-delay SECONDS]");
@@ -2364,6 +2383,9 @@ fn main() -> Result<()> {
             }
             "--ingest-only" => {
                 ingest_only = true;
+            }
+            "mcp" | "--mcp" => {
+                is_mcp = true;
             }
             "--nuke" => {
                 let db_name = db_path();
@@ -2461,13 +2483,18 @@ fn main() -> Result<()> {
         }
     }
 
+    let db_name = db_path();
+    let assets = assets_path();
+
+    if is_mcp {
+        let _ = log::set_max_level(LevelFilter::Off);
+        return mcp::start_server(&db_name, &assets);
+    }
+
     use std::io::IsTerminal;
     if !quiet && std::io::stderr().is_terminal() {
         eprintln!("pickbrain {} — Copyright (c) 2026 Dropbox Inc.", env!("CARGO_PKG_VERSION"));
     }
-
-    let db_name = db_path();
-    let assets = assets_path();
 
     // Migrate DB from old location (~/.claude/pickbrain.db)
     if !pickbrain_dir_overridden() && !db_name.exists() {

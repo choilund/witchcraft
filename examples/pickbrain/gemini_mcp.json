@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "pickbrain": {
+      "command": "/home/ch/.cargo/bin/cargo",
+      "args": [
+        "run",
+        "--manifest-path",
+        "/witchcraft/Cargo.toml",
+        "--example",
+        "pickbrain",
+        "--features",
+        "t5-quantized",
+        "--",
+        "mcp"
+      ]
+    }
+  }
+}
