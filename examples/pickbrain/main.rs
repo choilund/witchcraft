@@ -2404,6 +2404,10 @@ fn main() -> Result<()> {
                 eprintln!("  EXTRA_GEMINI_DIRS   colon-separated additional .gemini/antigravity directories");
                 std::process::exit(0);
             }
+            "--version" | "-V" => {
+                println!("pickbrain {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "mcp" | "--mcp" => {
                 is_mcp = true;
             }

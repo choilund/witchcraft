@@ -1,0 +1,49 @@
+name: Release Pickbrain Binary
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release-linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download ModernBERT assets
+        run: |
+          mkdir -p assets
+          curl --fail --location --output assets/modernbert-assets.tar.gz \
+            https://github.com/dropbox/witchcraft/releases/download/modernbert-96d-gated-v1/modernbert-assets.tar.gz
+          tar -xzf assets/modernbert-assets.tar.gz -C assets
+          cargo run -p quantize --release -- assets/modernbert.safetensors assets/modernbert.gguf
+
+      - name: Build pickbrain release binary
+        run: |
+          cargo build --release --example pickbrain \
+            --features modernbert-quantized,embed-assets,fbgemm,hybrid-dequant,progress,sqlite
+
+      - name: Package release archive and SHA256
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ARCHIVE="pickbrain_${VERSION}_linux_amd64.tar.gz"
+          cp target/release/examples/pickbrain pickbrain
+          tar -czf "${ARCHIVE}" pickbrain
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            pickbrain_*_linux_amd64.tar.gz
+            pickbrain_*_linux_amd64.tar.gz.sha256
+          generate_release_notes: true
+
