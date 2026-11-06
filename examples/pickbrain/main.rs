@@ -521,7 +521,7 @@ fn read_turn_at(path: &str, source: &str, tm: &TurnMeta) -> Option<SessionTurn> 
 
 
 /// Parse a duration string like "24h", "7d", "2w" into milliseconds.
-fn parse_since(s: &str) -> Option<i64> {
+pub(crate) fn parse_since(s: &str) -> Option<i64> {
     let s = s.trim();
     let (num_str, unit) = s.split_at(s.len().saturating_sub(1));
     let n: i64 = num_str.parse().ok()?;
@@ -2109,7 +2109,7 @@ fn parse_range(s: &str) -> (usize, usize) {
     }
 }
 
-fn fetch_session_text(
+pub(crate) fn fetch_session_text(
     db: &DB,
     session_id: &str,
     turns_range: Option<&str>,
