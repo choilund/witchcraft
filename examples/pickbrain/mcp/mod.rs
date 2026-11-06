@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(untagged)]
@@ -29,15 +29,31 @@ pub struct JsonRpcResponse {
 
 pub mod tools;
 
-pub fn start_server(db_name: &std::path::PathBuf, assets: &std::path::PathBuf) -> Result<()> {
-    let device = witchcraft::make_device();
-    let embedder = witchcraft::Embedder::new(&device, assets)?;
-    let mut cache = witchcraft::EmbeddingsCache::new(1);
-    let db = witchcraft::DB::new_reader(db_name.clone())?;
+pub struct ServerState {
+    pub db: witchcraft::DB,
+    pub embedder: witchcraft::Embedder,
+    pub cache: witchcraft::EmbeddingsCache,
+}
 
+impl ServerState {
+    pub fn init(db_name: &std::path::Path, assets: &std::path::Path) -> Result<Self> {
+        let device = witchcraft::make_device();
+        let embedder = witchcraft::Embedder::new(&device, assets)?;
+        let cache = witchcraft::EmbeddingsCache::new(1);
+        let db = witchcraft::DB::new_reader(db_name.to_path_buf())?;
+        Ok(Self {
+            db,
+            embedder,
+            cache,
+        })
+    }
+}
+
+pub fn start_server(db_name: &std::path::PathBuf, assets: &std::path::PathBuf) -> Result<()> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut line = String::new();
+    let mut state: Option<ServerState> = None;
 
     loop {
         line.clear();
@@ -46,26 +62,89 @@ pub fn start_server(db_name: &std::path::PathBuf, assets: &std::path::PathBuf) -
             break; // EOF
         }
 
-        if let Some(resp_json) = handle_request(&line, &db, &embedder, &mut cache) {
+        if let Some(resp_json) = dispatch_request(&line, |id, params| {
+            if state.is_none() {
+                match ServerState::init(db_name, assets) {
+                    Ok(s) => state = Some(s),
+                    Err(e) => {
+                        return JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            id,
+                            result: None,
+                            error: Some(serde_json::json!({
+                                "code": -32603,
+                                "message": format!("Backend initialization failed: {}", e)
+                            })),
+                        };
+                    }
+                }
+            }
+            let s = state.as_mut().unwrap();
+            execute_tool_call(id, params, &s.db, &s.embedder, &mut s.cache)
+        }) {
             println!("{}", resp_json);
+            io::stdout().flush()?;
         }
     }
     Ok(())
 }
 
-pub fn handle_request(
-    raw_json: &str,
+fn execute_tool_call(
+    id: Option<JsonRpcId>,
+    params: Option<serde_json::Value>,
     db: &witchcraft::DB,
     embedder: &witchcraft::Embedder,
     cache: &mut witchcraft::EmbeddingsCache,
-) -> Option<String> {
+) -> JsonRpcResponse {
+    if let Some(params) = params {
+        let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        let args = params.get("arguments").cloned();
+
+        match tools::handle_tool_call(name, args, db, embedder, cache) {
+            Ok(result) => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id,
+                result: Some(result),
+                error: None,
+            },
+            Err(e) => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id,
+                result: None,
+                error: Some(serde_json::json!({
+                    "code": -32603,
+                    "message": format!("Tool execution failed: {}", e)
+                })),
+            },
+        }
+    } else {
+        JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(serde_json::json!({
+                "code": -32602,
+                "message": "Missing params for tools/call"
+            })),
+        }
+    }
+}
+
+pub fn dispatch_request<F>(raw_json: &str, mut on_tool_call: F) -> Option<String>
+where
+    F: FnMut(Option<JsonRpcId>, Option<serde_json::Value>) -> JsonRpcResponse,
+{
     let req: JsonRpcRequest = match serde_json::from_str(raw_json) {
         Ok(r) => r,
         Err(_) => return None,
     };
-    
-    if req.method == "initialize" {
-        return Some(serde_json::to_string(&JsonRpcResponse {
+
+    if req.id.is_none() {
+        return None;
+    }
+
+    let resp = match req.method.as_str() {
+        "initialize" => JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: req.id,
             result: Some(serde_json::json!({
@@ -79,38 +158,54 @@ pub fn handle_request(
                 }
             })),
             error: None,
-        }).unwrap());
-    } else if req.method == "tools/list" {
-        return Some(serde_json::to_string(&JsonRpcResponse {
+        },
+        "ping" => JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: req.id,
+            result: Some(serde_json::json!({})),
+            error: None,
+        },
+        "resources/list" => JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: req.id,
+            result: Some(serde_json::json!({ "resources": [] })),
+            error: None,
+        },
+        "prompts/list" => JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: req.id,
+            result: Some(serde_json::json!({ "prompts": [] })),
+            error: None,
+        },
+        "tools/list" => JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: req.id,
             result: Some(tools::list_tools()),
             error: None,
-        }).unwrap());
-    } else if req.method == "tools/call" {
-        if let Some(params) = req.params {
-            let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            let args = params.get("arguments").cloned();
-            
-            if let Ok(result) = tools::handle_tool_call(name, args, db, embedder, cache) {
-                return Some(serde_json::to_string(&JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: req.id,
-                    result: Some(result),
-                    error: None,
-                }).unwrap());
-            } else {
-                return Some(serde_json::to_string(&JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: req.id,
-                    result: None,
-                    error: Some(serde_json::json!({ "code": -32603, "message": "Tool execution failed" })),
-                }).unwrap());
-            }
-        }
-    }
-    None
+        },
+        "tools/call" => on_tool_call(req.id, req.params),
+        _ => JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id: req.id,
+            result: None,
+            error: Some(serde_json::json!({
+                "code": -32601,
+                "message": format!("Method not found: {}", req.method)
+            })),
+        },
+    };
+
+    Some(serde_json::to_string(&resp).unwrap())
 }
 
-// In unit tests we omit state execution by ignoring test outputs
-// We only run mcp struct tests on a mock integration suite within core tests.
+#[allow(dead_code)]
+pub fn handle_request(
+    raw_json: &str,
+    db: &witchcraft::DB,
+    embedder: &witchcraft::Embedder,
+    cache: &mut witchcraft::EmbeddingsCache,
+) -> Option<String> {
+    dispatch_request(raw_json, |id, params| {
+        execute_tool_call(id, params, db, embedder, cache)
+    })
+}
